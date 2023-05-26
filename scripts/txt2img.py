@@ -29,6 +29,15 @@ def load_model_from_config(config, ckpt, verbose=False):
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
+    ckpt = model.state_dict()
+    remove = []
+    for key in ckpt.keys():
+        assert key in sd, key
+        if ckpt[key].shape != sd[key].shape:
+            remove.append(key)
+    for r in remove:
+        sd.pop(r)
+        print(f'pop key {r}')
     m, u = model.load_state_dict(sd, strict=False)
     if len(m) > 0 and verbose:
         print("missing keys:")
@@ -47,8 +56,8 @@ def main():
 
     parser.add_argument(
         "--prompt",
+        nargs='+',
         type=str,
-        nargs="?",
         default="a painting of a virus monster playing guitar",
         help="the prompt to render"
     )
@@ -157,11 +166,11 @@ def main():
         type=float,
         help="dynamic thresholding from Imagen, in latent space (TODO: try in pixel space with intermediate decode)",
     )
-    parser.add_argument(
-        "--from-file",
-        type=str,
-        help="if specified, load prompts from this file",
-    )
+    # parser.add_argument(
+    #     "--from-file",
+    #     type=str,
+    #     help="if specified, load prompts from this file",
+    # )
     parser.add_argument(
         "--config",
         type=str,
@@ -204,18 +213,13 @@ def main():
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
+    prompt = opt.prompt
+    assert isinstance(prompt, list)
+    print(prompt)
+    opt.n_samples = opt.n_samples if len(prompt) == 1 else len(prompt)
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
+    data = [prompt * batch_size] if len(prompt) == 1 else [prompt]
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)

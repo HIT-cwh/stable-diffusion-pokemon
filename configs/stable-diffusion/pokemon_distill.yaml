@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 1.0e-04
-  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  target: ldm.models.diffusion.ddpm.LatentDiffusionDistill
   params:
     linear_start: 0.00085
     linear_end: 0.0120
@@ -14,6 +14,8 @@ model:
     cond_stage_trainable: false   # Note: different from the one we trained before
     conditioning_key: crossattn
     scale_factor: 0.18215
+    ddim_steps_stu: 16
+    use_ema: True
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
@@ -70,7 +72,7 @@ model:
 
 
 data:
-  target: main.DataModuleFromConfig
+  target: distill.DataModuleFromConfig
   params:
     batch_size: 4
     num_workers: 4
@@ -106,21 +108,21 @@ lightning:
   modelcheckpoint:
     params:
       # every_n_train_steps: 3000
-      every_n_epochs: 30
+      every_n_epochs: 32
       save_top_k: -1
       monitor: null
       save_weights_only: True
 
   callbacks:
     image_logger:
-      target: main.ImageLogger
+      target: distill.ImageLogger
       params:
         batch_frequency: 2000
         max_images: 4
         increase_log_steps: False
         log_first_step: True
         log_all_val: True
-        epoch_freq: 10
+        epoch_freq: 2
         log_images_kwargs:
           use_ema_scope: True
           inpaint: False
@@ -129,10 +131,10 @@ lightning:
           N: 4
           unconditional_guidance_scale: 10.0
           unconditional_guidance_label: [""]
-          ddim_steps: 32
+          ddim_steps: 50
 
   trainer:
     benchmark: True
     num_sanity_val_steps: 0
     accumulate_grad_batches: 1
-    max_epochs: 240
+    max_epochs: 16

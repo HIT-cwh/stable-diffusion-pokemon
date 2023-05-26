@@ -6,8 +6,11 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+import copy
+import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import LambdaLR
@@ -723,14 +726,14 @@ class LatentDiffusion(DDPM):
             x = x[:bs]
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
+        z = self.get_first_stage_encoding(encoder_posterior).detach()  # 4, 4, 64, 64
 
         if self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox', "txt"]:
-                    xc = batch[cond_key]
+                    xc = batch[cond_key]  # captions: list
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
@@ -1270,7 +1273,7 @@ class LatentDiffusion(DDPM):
         return c
 
     @torch.no_grad()
-    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
+    def log_images(self, batch, N=4, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
                    plot_diffusion_rows=True, unconditional_guidance_scale=1., unconditional_guidance_label=None,
                    use_ema_scope=True,
@@ -1441,6 +1444,278 @@ class LatentDiffusion(DDPM):
         x = nn.functional.conv2d(x, weight=self.colorize)
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
+    
+
+class LatentDiffusionDistill(LatentDiffusion):
+    def __init__(self, ddim_steps_stu, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.teacher_model: nn.Module
+        # self.teacher_model = copy.deepcopy(self.model)
+        # self.teacher_model.eval()
+        # self.teacher_model.requires_grad_(False)
+
+        self.ddim_steps_stu = ddim_steps_stu
+        self.ddim_steps_tea = ddim_steps_stu * 2
+        self.ddim_sampler_stu = DDIMSampler(self)
+        assert self.num_timesteps == 1024
+        self.ddim_sampler_stu.make_schedule(ddim_steps_stu, steps_offset=self.num_timesteps // ddim_steps_stu - 1)
+        print('ddim_sampler_stu.ddim_timesteps: ', self.ddim_sampler_stu.ddim_timesteps)
+        self.ddim_sampler_tea = DDIMSampler(self)
+        self.ddim_sampler_tea.make_schedule(self.ddim_steps_tea, steps_offset=self.num_timesteps // self.ddim_steps_tea - 1)
+        print('ddim_sampler_tea.ddim_timesteps: ', self.ddim_sampler_tea.ddim_timesteps)
+
+        self.ddim_timesteps_stu = torch.from_numpy(self.ddim_sampler_stu.ddim_timesteps).to(self.device)
+        self.ddim_timesteps_tea = torch.from_numpy(self.ddim_sampler_tea.ddim_timesteps).to(self.device)
+
+        self.guidance_scale_min = 1
+        self.guidance_scale_max = 14
+    
+    @torch.no_grad()
+    def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
+                  cond_key=None, return_original_cond=False, bs=None, return_x=False):
+        # x = super().get_input(batch, k)
+        x = DDPM.get_input(self, batch, k)
+        if bs is not None:
+            x = x[:bs]
+        x = x.to(self.device)
+        encoder_posterior = self.encode_first_stage(x)
+        z = self.get_first_stage_encoding(encoder_posterior).detach()  # 4, 4, 64, 64
+
+        if self.model.conditioning_key is not None:
+            if cond_key is None:
+                cond_key = self.cond_stage_key
+            if cond_key != self.first_stage_key:
+                if cond_key in ['caption', 'coordinates_bbox', "txt"]:
+                    xc = batch[cond_key]  # captions: list
+                    xc_empty_txt = [''] * len(xc)
+                elif cond_key == 'class_label':
+                    xc = batch
+                else:
+                    xc = super().get_input(batch, cond_key).to(self.device)
+            else:
+                xc = x
+            if not self.cond_stage_trainable or force_c_encode:
+                if isinstance(xc, dict) or isinstance(xc, list):
+                    c = self.get_learned_conditioning(xc)
+                    c_empty_txt = self.get_learned_conditioning(xc_empty_txt)
+                else:
+                    c = self.get_learned_conditioning(xc.to(self.device))
+            else:
+                c = xc
+            if bs is not None:
+                c = c[:bs]
+
+            if self.use_positional_encodings:
+                pos_x, pos_y = self.compute_latent_shifts(batch)
+                ckey = __conditioning_keys__[self.model.conditioning_key]
+                c = {ckey: c, 'pos_x': pos_x, 'pos_y': pos_y}
+
+        else:
+            c = None
+            xc = None
+            if self.use_positional_encodings:
+                pos_x, pos_y = self.compute_latent_shifts(batch)
+                c = {'pos_x': pos_x, 'pos_y': pos_y}
+        out = [z, c, c_empty_txt]
+        if return_first_stage_outputs:
+            xrec = self.decode_first_stage(z)
+            out.extend([x, xrec])
+        if return_x:
+            out.extend([x])
+        if return_original_cond:
+            out.append(xc)
+        return out
+    
+    def shared_step(self, batch, **kwargs):
+        x, c, c_empty_txt = self.get_input(batch, self.first_stage_key)
+        loss = self(x, c, c_empty_txt)
+        return loss
+    
+    def forward(self, x, c, c_empty_txt, *args, **kwargs):
+        idx = torch.randint(0, len(self.ddim_timesteps_stu), (x.shape[0],), device=self.device)
+        timesteps = self.ddim_timesteps_stu[idx].long()
+        timesteps = timesteps.to(device=self.device)
+        timesteps_tea_1 = timesteps
+        timesteps_tea_2 = timesteps - self.num_timesteps // self.ddim_steps_tea
+
+        # t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        # assert self.model.conditioning_key is None, 'self.model.conditioning_key is not None'
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            assert not self.cond_stage_trainable and not self.shorten_cond_schedule
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[timesteps].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        return self.p_losses_distill(x, c, c_empty_txt, timesteps, timesteps_tea_1, timesteps_tea_2, idx, *args, **kwargs)
+
+    def p_losses_distill(self, x_start, cond, cond_empty_txt, timesteps, timesteps_tea_1, timesteps_tea_2, idx, noise=None):
+        # todo: ema
+
+        guidance_scale = random.random() * (self.guidance_scale_max - self.guidance_scale_min) + self.guidance_scale_min
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=timesteps, noise=noise)
+
+        with torch.no_grad():
+            img, _ = self.ddim_sampler_tea.p_sample_ddim_distill(x_noisy, cond, timesteps_tea_1, idx*2+1, unconditional_conditioning=cond_empty_txt,
+                                                                       unconditional_guidance_scale=guidance_scale, is_tea=True)
+            img, _ = self.ddim_sampler_tea.p_sample_ddim_distill(img, cond, timesteps_tea_2, idx*2, unconditional_conditioning=cond_empty_txt,
+                                                                       unconditional_guidance_scale=guidance_scale, is_tea=True)
+            img_tea = img.detach()
+        
+        img_stu, _ = self.ddim_sampler_stu.p_sample_ddim_distill(x_noisy, cond, timesteps, idx, unconditional_conditioning=cond_empty_txt,
+                                                                       unconditional_guidance_scale=guidance_scale, is_tea=False)
+
+        loss = F.mse_loss(img_stu.float(), img_tea.float(), reduction="mean")
+        loss_dict = {}
+        loss_dict.update({'distill_loss': loss})
+        return loss, loss_dict
+    
+    def apply_model_tea(self, x_noisy, t, cond, return_ids=False):
+        if isinstance(cond, dict):
+            # hybrid case, cond is exptected to be a dict
+            pass
+        else:
+            if not isinstance(cond, list):
+                cond = [cond]
+            key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
+            cond = {key: cond}
+
+        assert not hasattr(self, "split_input_params")
+        x_recon = self.teacher_model(x_noisy, t, **cond)
+        if isinstance(x_recon, tuple) and not return_ids:
+            return x_recon[0]
+        else:
+            return x_recon
+    
+    @torch.no_grad()
+    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
+                   quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
+                   plot_diffusion_rows=True, unconditional_guidance_scale=1., unconditional_guidance_label=None,
+                   use_ema_scope=True,
+                   **kwargs):
+        ema_scope = self.ema_scope if use_ema_scope else nullcontext
+        use_ddim = self.ddim_steps_stu is not None
+
+        log = dict()
+        z, c, c_empty_txt, x, xrec, xc = self.get_input(batch, self.first_stage_key,
+                                           return_first_stage_outputs=True,
+                                           force_c_encode=True,
+                                           return_original_cond=True,
+                                           bs=N)
+        N = min(x.shape[0], N)
+        n_row = min(x.shape[0], n_row)
+        log["inputs"] = x
+        log["reconstruction"] = xrec
+        if self.model.conditioning_key is not None:
+            if hasattr(self.cond_stage_model, "decode"):
+                xc = self.cond_stage_model.decode(c)
+                log["conditioning"] = xc
+            elif self.cond_stage_key in ["caption", "txt"]:
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch[self.cond_stage_key], size=x.shape[2]//25)
+                log["conditioning"] = xc
+            elif self.cond_stage_key == 'class_label':
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["human_label"], size=x.shape[2]//25)
+                log['conditioning'] = xc
+            elif isimage(xc):
+                log["conditioning"] = xc
+            if ismap(xc):
+                log["original_conditioning"] = self.to_rgb(xc)
+
+        if plot_diffusion_rows:
+            # get diffusion row
+            diffusion_row = list()
+            z_start = z[:n_row]
+            for t in range(self.num_timesteps):
+                if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+                    t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+                    t = t.to(self.device).long()
+                    noise = torch.randn_like(z_start)
+                    z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+                    diffusion_row.append(self.decode_first_stage(z_noisy))
+
+            diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
+            diffusion_grid = rearrange(diffusion_row, 'n b c h w -> b n c h w')
+            diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
+            diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
+            log["diffusion_row"] = diffusion_grid
+
+        if sample:
+            # get denoise row
+            with ema_scope("Sampling"):
+                samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
+                                                         ddim_steps=self.ddim_steps_stu,eta=ddim_eta)
+                # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
+            x_samples = self.decode_first_stage(samples)
+            log["samples"] = x_samples
+            if plot_denoise_rows:
+                denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
+                log["denoise_row"] = denoise_grid
+
+            if quantize_denoised and not isinstance(self.first_stage_model, AutoencoderKL) and not isinstance(
+                    self.first_stage_model, IdentityFirstStage):
+                # also display when quantizing x0 while sampling
+                with ema_scope("Plotting Quantized Denoised"):
+                    samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
+                                                             ddim_steps=self.ddim_steps_stu,eta=ddim_eta,
+                                                             quantize_denoised=True)
+                    # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
+                    #                                      quantize_denoised=True)
+                x_samples = self.decode_first_stage(samples.to(self.device))
+                log["samples_x0_quantized"] = x_samples
+
+        if unconditional_guidance_scale > 1.0:
+            uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)
+            # uc = torch.zeros_like(c)
+            with ema_scope("Sampling student model with classifier-free guidance"):
+                samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                 ddim_steps=self.ddim_steps_stu, eta=ddim_eta,
+                                                 unconditional_guidance_scale=unconditional_guidance_scale,
+                                                 unconditional_conditioning=uc,
+                                                 )
+                x_samples_cfg = self.decode_first_stage(samples_cfg)
+                log[f"stu_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+            
+            # don't need to switch to EMA weights
+            samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                ddim_steps=self.ddim_steps_tea, eta=ddim_eta,
+                                                unconditional_guidance_scale=unconditional_guidance_scale,
+                                                unconditional_conditioning=uc, is_tea=True
+                                                )
+            x_samples_cfg = self.decode_first_stage(samples_cfg)
+            log[f"tea_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+
+        assert not inpaint
+
+        if plot_progressive_rows:
+            with ema_scope("Plotting Progressives"):
+                img, progressives = self.progressive_denoising(c,
+                                                               shape=(self.channels, self.image_size, self.image_size),
+                                                               batch_size=N)
+            prog_row = self._get_denoise_row_from_list(progressives, desc="Progressive Generation")
+            log["progressive_row"] = prog_row
+
+        if return_keys:
+            if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:
+                return log
+            else:
+                return {key: log[key] for key in return_keys}
+        return log
+    
+    @torch.no_grad()
+    def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+        if ddim:
+            ddim_sampler = DDIMSampler(self)
+            shape = (self.channels, self.image_size, self.image_size)
+            samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size,
+                                                         shape, cond, verbose=False, **kwargs)
+
+        else:
+            samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
+                                                 return_intermediates=True, **kwargs)
+
+        return samples, intermediates
 
 
 class DiffusionWrapper(pl.LightningModule):

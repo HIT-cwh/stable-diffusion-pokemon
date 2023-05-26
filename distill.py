@@ -4,6 +4,7 @@ import time
 import torch
 import torchvision
 import pytorch_lightning as pl
+import copy
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -19,6 +20,7 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
+from ldm.modules.ema import LitEma
 
 
 MULTINODE_HACKS = False
@@ -674,6 +676,11 @@ if __name__ == "__main__":
         # model
         model = instantiate_from_config(config.model)
         model.cpu()
+        print(model.use_ema)
+
+        if not model.use_ema:
+            # load pretrained ema_ckpt to student model and don't use ema during training
+            model.model_ema = LitEma(model.model)
 
         if not opt.finetune_from == "":
             rank_zero_print(f"Attempting to load state from {opt.finetune_from}")
@@ -716,6 +723,16 @@ if __name__ == "__main__":
                 rank_zero_print(u)
 
         model.model_ema.copy_to(model.model)
+        
+        # build teacher model
+        model.teacher_model = copy.deepcopy(model.model)
+        model.model_ema.copy_to(model.teacher_model)
+        model.teacher_model.eval()
+        model.teacher_model.requires_grad_(False)
+
+        if not model.use_ema:
+            # delete ema model
+            del model.model_ema
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -775,7 +792,7 @@ if __name__ == "__main__":
         # add callback which sets up log directory
         default_callbacks_cfg = {
             "setup_callback": {
-                "target": "main.SetupCallback",
+                "target": "distill.SetupCallback",
                 "params": {
                     "resume": opt.resume,
                     "now": now,
@@ -788,7 +805,7 @@ if __name__ == "__main__":
                 }
             },
             "image_logger": {
-                "target": "main.ImageLogger",
+                "target": "distill.ImageLogger",
                 "params": {
                     "batch_frequency": 750,
                     "max_images": 4,
@@ -796,14 +813,14 @@ if __name__ == "__main__":
                 }
             },
             "learning_rate_logger": {
-                "target": "main.LearningRateMonitor",
+                "target": "distill.LearningRateMonitor",
                 "params": {
                     "logging_interval": "step",
                     # "log_momentum": True
                 }
             },
             "cuda_callback": {
-                "target": "main.CUDACallback"
+                "target": "distill.CUDACallback"
             },
         }
         if version.parse(pl.__version__) >= version.parse('1.4.0'):
