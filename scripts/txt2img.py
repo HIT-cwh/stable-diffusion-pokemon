@@ -1,3 +1,9 @@
+"""
+python scripts/txt2img.py --prompt 'yoda' 'A pokemon with green eyes, large wings, and a hat' 'A cute bunny rabbit' 'An epic landscape photo of a mountain' 
+--outdir 'outputs/generated_pokemon' --H 512 --W 512 --n_samples 4 --config configs/stable-diffusion/pokemon.yaml 
+--ckpt /nvme/caoweihan.p/pokemon_1024/2023-05-26T10-37-32_pokemon/checkpoints/epoch\=000179.ckpt --scale 10 --ddim_steps 32
+"""
+
 import argparse, os, sys, glob
 import torch
 import numpy as np

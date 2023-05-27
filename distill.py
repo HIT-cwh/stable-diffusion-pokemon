@@ -1,3 +1,8 @@
+"""
+python distill.py -t --base configs/stable-diffusion/pokemon_distill.yaml --gpus 0,1 --scale_lr False --num_nodes 1 --check_val_every_n_epoch 1 
+--finetune_from /nvme/caoweihan.p/pokemon_1024/2023-05-26T10-37-32_pokemon/checkpoints/epoch=000179.ckpt
+"""
+
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
